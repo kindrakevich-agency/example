@@ -1,0 +1,419 @@
+<?php
+
+/**
+* @file
+* The Xopt module provides login redirect for anonymous users
+* api for CRM connect, account form for dealers, and ajax functions for orders
+* and flag
+*/
+
+/**
+* Check if anonymous user and redirect it to login (exclude API path for
+* CRM connect).
+*/
+function xopt_login_redirect() {
+   global $user;
+   if (variable_get('maintenance_mode', FALSE)) {
+     return;
+   }
+   if (user_is_anonymous()) {
+     if(request_uri()=='/api') return;
+     $redirect = TRUE;
+     $login_path = variable_get('anonymous_login_page_path', 'user/login');
+     foreach (array('cron', 'install', 'xmlrpc') as $task) {
+       $path = base_path() . "{$task}.php";
+       if (substr(request_uri(), 0, strlen($path)) == $path) {
+         return;
+       }
+     }
+     if (!drupal_is_cli()) {
+       $paths = xopt_login_paths();
+       if (!empty($paths['include'])) {
+         $path = drupal_strtolower(filter_xss($_GET['q']));
+         $path = $path ? $path : '<front>';
+         $alias = strtolower(drupal_get_path_alias($path));
+         foreach (array($path, $alias) as $check) {
+           if (drupal_match_path($check, implode("\n", $paths['include']))) {
+             $redirect = TRUE;
+           }
+           if (drupal_match_path($check, implode("\n", $paths['exclude']))) {
+             $redirect = FALSE;
+             break;
+           }
+         }
+         if ($redirect) {
+           $destination = array(
+             'destination' => $alias,
+           );
+           drupal_goto($login_path, array('query' => $destination));
+         }
+       }
+     }
+   }
+}
+
+/**
+ * Return array of paths to include and exclude for anonymous login redirect.
+ */
+function xopt_login_paths() {
+   $paths = array('include' => array(), 'exclude' => array());
+   $paths['include'][] = 'test';
+   $paths['exclude'][] = variable_get('anonymous_login_page_path', 'user/login');
+   $paths['exclude'][] = 'user/reset/*';
+   $paths['exclude'][] = 'user/register';
+   return $paths;
+}
+
+/**
+ * Implements hook_init().
+ */
+function xopt_init() {
+   global $user;
+   xopt_login_redirect();
+   drupal_add_js(drupal_get_path('module', 'xopt') .'/js/xopt.js', array('type' => 'file'));
+   drupal_add_js(array(
+     'xopt' => array(
+       'ajax' => '/ajax/xopt',
+       'uid' => user_is_logged_in(),
+     )
+   ), 'setting');
+}
+
+/**
+ * Implement hook_menu().
+ */
+function xopt_menu() {
+  $items['ajax/xopt/%'] = array(
+    'page callback' => 'xopt_ajax',
+    'page arguments' => array(2),
+    'access callback'   => true,
+    'delivery callback' => 'drupal_json_output',
+  );
+  $items['api'] = array(
+    'page callback' => 'xopt_api',
+    'access callback'   => true,
+    'delivery callback' => 'drupal_json_output',
+  );
+  return $items;
+}
+
+function xopt_api(){
+	global $user;
+	$result = true;
+	$data = json_decode(file_get_contents('php://input'), true);
+	if(isset($data)){
+    if($data['user']['username']=='test' && $data['user']['password']=='test'){
+      if($data["orderid"] && $data["status"]){
+        $oid = $data["orderid"];
+        $order = db_select('orders', 'o')->fields('o')->condition('o.id', $oid)->execute()->fetchObject();
+        if($order->status<$data["status"]){
+          db_update('orders')->fields(array('status' => $data["status"]))->condition('id', $oid)->execute();
+          if($data["status"]==3){
+            $title = 'Ваше замовлення прийнято в роботу';
+            $orderid = '№U'.$order->uid.'O'.$order->id.'N'.$order->nid;
+            $message = 'Замовлення '.$orderid.' для '.$order->name.', '.$order->price.'грн';
+          }
+          if($data["status"]==4){
+            $title = 'Ваше замовлення відправлене';
+            $orderid = '№U'.$order->uid.'O'.$order->id.'N'.$order->nid;
+            $message = 'Замовлення '.$orderid.' для '.$order->name.', '.$order->price.'грн';
+          }
+          $fields = array(
+            'uid' => $order->uid,
+            'oid' => $order->id,
+            'status' => $data["status"],
+            'date' => time(),
+            'title' => $title,
+            'message' => $message,
+          );
+          db_insert('orders_messages')->fields($fields)->execute();
+        }
+      }
+    }
+	}
+	return $result;
+}
+
+function xopt_ajax($op, $post = NULL){
+  global $user;
+  $output = '';
+  if(!$post) $post = $_POST;
+  switch($op){
+    case 'flag':
+      if(isset($post['nid']) && $post['nid']){
+        $account = user_load($user->uid);
+        $flag = flag_get_flag('bookmarks');
+        if($flag->is_flagged($post['nid'])){
+          $output = 'mdi mdi-heart-outline';
+          flag('unflag', 'bookmarks', $post['nid'], $account);
+        } else {
+          $output = 'mdi mdi-heart text-danger';
+          flag('flag', 'bookmarks', $post['nid'], $account);
+        }
+      }
+    break;
+    case 'order-delete':
+      if(isset($post['oid']) && $post['oid']){
+        $order = db_select('orders', 'o')->fields('o')->condition('o.id', $post['oid'])->execute()->fetchObject();
+        if($order){
+          if($order->uid==$user->uid){
+            db_update('orders')->fields(array('status' => 5))->condition('id', $post['oid'])->execute();
+          }
+        }
+      }
+    break;
+    case 'order-send':
+      if(isset($post['oid']) && $post['oid']){
+        $order = db_select('orders', 'o')->fields('o')->condition('o.id', $post['oid'])->execute()->fetchObject();
+        if($order){
+          if($order->uid==$user->uid){
+            db_update('orders')->fields(array('status' => 2))->condition('id', $post['oid'])->execute();
+            $title = 'Ваше замовлення очікує на розгляд';
+            $orderid = '№U'.$order->uid.'O'.$order->id.'N'.$order->nid;
+            $message = 'Замовлення '.$orderid.' для '.$order->name.', '.$order->price.'грн';
+            $fields = array(
+              'uid' => $user->uid,
+              'oid' => $order->id,
+              'date' => time(),
+              'title' => $title,
+              'message' => $message,
+            );
+            db_insert('orders_messages')->fields($fields)->execute();
+
+            $info = xopt_dealer_info($order->uid);
+            $prepayment = xopt_price_info('prepayment', $order->id);
+            $open = 'Праве відкривання';
+            if($order->open==2){
+              $open = 'Ліве відкривання';
+            }
+            $ip = ip_address();
+            $message = [];
+            $message[] = $order->door_name;
+            if($order->door_type==2){
+              $message[] = 'Склад';
+            } else {
+              $message[] = 'Під замовлення';
+            }
+            $message[] = 'ПІБ замовника: '.$order->name;
+            $message[] = 'Номер телефону замовника: '.$order->phone;
+            $message[] = 'Адрес замовника: '.$order->address;
+            $message[] = 'Націнка дилера: '.$info['percent'].'%';
+            $message[] = 'Націнка наша: '.variable_get('manufacturer_1', '20').'%';
+            $message[] = 'Передоплата (наші % + дилер %): '.$prepayment.'грн';
+            $message[] = 'IP адрес: '.$ip;
+            $params = array(
+              'message' => implode('<br>',$message),
+              'subject' => 'Замовлення дверей'
+            );
+            $params['phone'] = $info['phone'];
+            $params['address'] = $info['address'];
+            $params['name'] = $info['name'];
+            $params['ordernum'] = $orderid;
+            $params['doornum'] = 1;
+            $params['image'] = $order->door_image_in;
+            $params['imageout'] = $order->door_image_out;
+            $params['totalprice'] = $order->price;
+            $params['doorarticle'] = $order->door_article;
+            $params['doorname'] = $order->door_name;
+            $params['doorwidth'] = $order->width;
+            $params['doorheight'] = $order->height;
+            $params['konstruktiv'] = drupal_json_decode($order->options);
+            if($order->dodatkovo){
+              $items = drupal_json_decode($order->dodatkovo);
+              $items = implode('<br>', $items);
+              $params['dodatkovo'] = $items;
+            }
+            if($order->furniture){
+              $items = drupal_json_decode($order->furniture);
+              $items = implode(PHP_EOL, $items);
+              $params['furniture'] = $items;
+            }
+            if($order->door_class){
+              $params['doorclass'] = $order->door_class;
+            }
+            $params['opendoor'] = $open;
+            $params['status'] = 24;
+            crm_send_data($params);
+          }
+        }
+      }
+    break;
+    case 'order-sklad':
+      if(isset($post['nid']) && $post['nid']){
+        $dealer = xopt_dealer_info($user->uid);
+        $open = 1;
+        if($post['opendoor']=='ліве-зовнішнє') $open = 2;
+        $fields = array(
+          'uid' => $user->uid,
+          'nid' => $post['nid'],
+          'date' => time(),
+          'percent' => $dealer['percent'],
+          'price' => $post['totalprice'],
+          'phone' => $post['phone'],
+          'name' => $post['name'],
+          'address' => $post['address'],
+          'width' => $post['doorwidth'],
+          'height' => $post['doorheight'],
+          'open' => $open,
+          'door_type' => 2,
+          'door_article' => $post['doorarticle'],
+          'door_name' => $post['doorname'],
+          'door_image_in' => $post['image'],
+          'door_image_out' => $post['imageout'],
+          'options' => drupal_json_encode($post['konstruktiv']),
+        );
+        db_insert('orders')->fields($fields)->execute();
+      }
+    break;
+    case 'order-doors':
+      if(isset($post['nid']) && $post['nid']){
+        $dealer = xopt_dealer_info($user->uid);
+        $open = 1;
+        if($post['opendoor']=='ліве-зовнішнє') $open = 2;
+        $fields = array(
+          'uid' => $user->uid,
+          'nid' => $post['nid'],
+          'date' => time(),
+          'percent' => $dealer['percent'],
+          'price' => $post['totalprice'],
+          'phone' => $post['phone'],
+          'name' => $post['name'],
+          'address' => $post['address'],
+          'width' => $post['doorwidth'],
+          'height' => $post['doorheight'],
+          'open' => $open,
+          'door_type' => 1,
+          'door_class' => $post['doorclass'],
+          'door_article' => $post['doorarticle'],
+          'door_name' => $post['doorname'],
+          'door_image_in' => $post['image'],
+          'door_image_out' => $post['imageout'],
+          'options' => drupal_json_encode($post['konstruktiv']),
+          'dodatkovo' => drupal_json_encode($post['dodatkovo']),
+          'furniture' => drupal_json_encode($post['furniture']),
+        );
+        db_insert('orders')->fields($fields)->execute();
+      }
+    break;
+  }
+  return array('result' => $output);
+}
+
+/**
+ * Form for dealers account.
+ */
+function xopt_account_form($form, &$form_state) {
+  global $user;
+  $account = user_load($user->uid);
+  $form = array(
+    '#attributes' => array(
+      'class' => array('needs-validation'),
+      'novalidate' => ''
+    ),
+  );
+  $form['row1'] = array(
+    '#type' => 'container',
+    '#attributes' => array('class' => array('row')),
+  );
+  $form['row1']['name'] = array(
+    '#title' => t('Прізвище, ім\'я та по батькові'),
+    '#type' => 'textfield',
+    '#maxlength' => 256,
+    '#required' => TRUE,
+    '#default_value' => $account->field_dealer_name['und'][0]['value'],
+    '#attributes' => array(
+      'placeholder' => '',
+      'required' => '',
+    ),
+    '#prefix' => '<div class="col-md-6"><div class="form-group">',
+    '#suffix' => '<div class="invalid-feedback">'.t('Обов\'язкове поле').'</div></div></div>',
+  );
+  $form['row1']['address'] = array(
+    '#title' => t('Адрес'),
+    '#type' => 'textfield',
+    '#maxlength' => 256,
+    '#required' => TRUE,
+    '#default_value' => $account->field_dealer_address['und'][0]['value'],
+    '#attributes' => array(
+      'placeholder' => t('Наприклад: Херсонська обл., м.Нова Каховка, вул.Шевченка 11/5'),
+      'required' => '',
+    ),
+    '#prefix' => '<div class="col-md-6"><div class="form-group">',
+    '#suffix' => '<div class="invalid-feedback">'.t('Обов\'язкове поле').'</div></div></div>',
+  );
+  $form['row2'] = array(
+    '#type' => 'container',
+    '#attributes' => array('class' => array('row')),
+  );
+  $form['row2']['phone'] = array(
+    '#title' => t('Номер телефону'),
+    '#type' => 'textfield',
+    '#maxlength' => 256,
+    '#required' => TRUE,
+    '#default_value' => $account->name,
+    '#attributes' => array(
+      'placeholder' => '',
+      'required' => '',
+    ),
+    '#prefix' => '<div class="col-md-6"><div class="form-group">',
+    '#suffix' => '<div class="invalid-feedback">'.t('Обов\'язкове поле').'</div></div></div>',
+  );
+  $form['row2']['percent'] = array(
+    '#title' => t('Ваша націнка у відсотках'),
+    '#type' => 'textfield',
+    '#maxlength' => 256,
+    '#required' => TRUE,
+    '#default_value' => $account->field_dealer_percent['und'][0]['value'],
+    '#attributes' => array(
+      'placeholder' => t('Наприклад: 10'),
+      'required' => '',
+    ),
+    '#prefix' => '<div class="col-md-6"><div class="form-group">',
+    '#suffix' => '<div class="invalid-feedback">'.t('Обов\'язкове поле').'</div></div></div>',
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Зберегти'),
+    '#submit' => array('xopt_account_form_submit'),
+  );
+  return $form;
+}
+
+/**
+ * Save dealers account info.
+ */
+function xopt_account_form_submit($form, &$form_state) {
+  global $user;
+  $name = $form_state['values']['name'];
+  $phone = $form_state['values']['phone'];
+  $address = $form_state['values']['address'];
+  $percent = $form_state['values']['percent'];
+  if(!$phone){
+    drupal_set_message(t("Поле номер телефону обов'язкове для заповнення!"));
+    drupal_goto('account');
+  }
+  if(!$name){
+    drupal_set_message(t("Поле прізвище, ім\'я та по батькові обов'язкове для заповнення!"));
+    drupal_goto('account');
+  }
+  if(!$address){
+    drupal_set_message(t("Поле адрес обов'язкове для заповнення!"));
+    drupal_goto('account');
+  }
+  if(!$percent){
+    drupal_set_message(t("Поле націнки у відсотках обов'язкове для заповнення!"));
+    drupal_goto('account');
+  }
+  if($user->uid==1){
+    drupal_set_message(t("Зміни для адміністратора неможливо зберегти!"));
+    drupal_goto('account');
+  }
+  $account = user_load($user->uid);
+  $account->field_dealer_percent['und'][0]['value'] = $percent;
+  $account->field_dealer_address['und'][0]['value'] = $address;
+  $account->field_dealer_name['und'][0]['value'] = $name;
+  $account->name = $phone;
+  user_save($account);
+  drupal_set_message(t('Ваші дані збережено!'));
+  drupal_goto('account');
+}
